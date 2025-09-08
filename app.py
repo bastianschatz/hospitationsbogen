@@ -1,23 +1,26 @@
-# app.py
-# Streamlit-Tool: BLI 3.0-basierter Hospitationsbogen (M1–M4) mit Auto-Bewertung & DOCX/JSON-Export
-# Run: streamlit run app.py
-# Dependencies: streamlit, python-docx
 
+# app.py
+# Streamlit-Tool: BLI 3.0-basierter Hospitationsbogen (M1–M4) mit Auto-Bewertung & DOCX/JSON/PDF-Export
+# Run lokal/Cloud: streamlit run app.py
+# Dependencies: streamlit, python-docx, fpdf2
+
+import io
 import json
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import streamlit as st
 from docx import Document
 from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from fpdf import FPDF  # für PDF-Export
 
 st.set_page_config(page_title="Hospitationsbogen (BLI 3.0)", layout="wide")
 
 # ----------------------------- Datenbasis -----------------------------
 # Kurzformulierungen entlang BLI 3.0 (Unterrichts-Merkmale M1–M4).
-# Diese Liste ist schul-intern anpassbar/erweiterbar (z. B. Indikatoren hinzufügen).
+# Schul-intern anpassbar/erweiterbar (z. B. Indikatoren hinzufügen).
 BLI_DATA = {
     "M1": {
         "title": "Schülerinnen und Schüler aktivieren",
@@ -78,7 +81,7 @@ AUTO_COMMENTS = {
 }
 
 # ----------------------------- Profile -----------------------------
-# Pro-Kolleg*in können Fokus-Merkmale und Gewichtungen hinterlegt werden.
+# Pro Kolleg*in Fokus-Merkmale und Gewichtungen hinterlegen:
 DEFAULT_PROFILES = {
     "— Neu —": {"focus": ["M1", "M3"], "weights": {"M1": 1.0, "M2": 1.0, "M3": 1.2, "M4": 1.0}},
     "Beispiel: Frau Müller": {"focus": ["M2"], "weights": {"M1": 1.0, "M2": 1.3, "M3": 1.0, "M4": 1.0}},
@@ -159,9 +162,11 @@ def export_docx(form: ObservationForm) -> bytes:
     meta.add_run(form.colleague + '    ')
     meta.add_run('Beobachter*in: ').bold = True
     meta.add_run(form.observer)
+
     meta = doc.add_paragraph()
     meta.add_run('Fach/Klasse/Thema: ').bold = True
     meta.add_run(f'{form.subject} / {form.grade} / {form.topic}')
+
     if form.school:
         meta = doc.add_paragraph()
         meta.add_run('Schule: ').bold = True
@@ -234,6 +239,68 @@ def export_json(form: ObservationForm) -> bytes:
     }
     return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
 
+def export_pdf(form: ObservationForm) -> bytes:
+    """Leichtgewichtiger PDF-Export ohne System-Abhängigkeiten."""
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "Hospitationsbogen – BLI 3.0", ln=True, align="C")
+
+    pdf.set_font("Helvetica", size=11)
+
+    def line(txt=""):
+        pdf.multi_cell(0, 6, txt)
+
+    # Meta
+    line(f"Datum: {form.date}")
+    line(f"Kolleg*in: {form.colleague}")
+    line(f"Beobachter*in: {form.observer}")
+    line(f"Fach/Klasse/Thema: {form.subject} / {form.grade} / {form.topic}")
+    if form.school:
+        line(f"Schule: {form.school}")
+    if form.profile_focus:
+        line("Profil-Fokus: " + ", ".join(form.profile_focus))
+    pdf.ln(2)
+
+    # Module + Kriterien
+    for mk, mod in form.modules.items():
+        pdf.set_font("Helvetica", "B", 13)
+        line(f"{mk} – {BLI_DATA[mk]['title']}")
+        pdf.set_font("Helvetica", size=11)
+        for ck, cres in mod.criteria.items():
+            line(f"{ck} {BLI_DATA[mk]['criteria'][ck]}")
+            line(f"  Bewertung: {cres.rating}/4")
+            if cres.comment:
+                line(f"  Kommentar: {cres.comment}")
+            pdf.ln(1)
+        pdf.ln(2)
+
+    # Stärken / nächste Schritte
+    pdf.set_font("Helvetica", "B", 13)
+    line("Stärken")
+    pdf.set_font("Helvetica", size=11)
+    line(form.strengths or "-")
+    pdf.ln(2)
+
+    pdf.set_font("Helvetica", "B", 13)
+    line("Nächste Schritte (konkret, terminiert)")
+    pdf.set_font("Helvetica", size=11)
+    line(form.next_steps or "-")
+    pdf.ln(2)
+
+    # Scores
+    per_module, overall = compute_scores(form)
+    pdf.set_font("Helvetica", "B", 13)
+    line("Zusammenfassung (Scores)")
+    pdf.set_font("Helvetica", size=11)
+    for mk, sc in per_module.items():
+        line(f"{mk}: {sc:.2f} / 4")
+    line(f"Gesamt (gewichtet): {overall:.2f} / 4")
+
+    # Rückgabe als Bytes
+    return pdf.output(dest="S").encode("latin-1", errors="ignore")
+
 # ----------------------------- UI -----------------------------
 st.title("Hospitationsbogen (BLI 3.0) – Generator")
 
@@ -249,7 +316,7 @@ with st.sidebar:
     weights_default = profiles[selected_profile]["weights"]
 
     st.subheader("Fokus-Merkmale")
-    focus = []
+    focus: List[str] = []
     cols = st.columns(4)
     all_modules = list(BLI_DATA.keys())
     for i, mk in enumerate(all_modules):
@@ -259,14 +326,18 @@ with st.sidebar:
                 focus.append(mk)
 
     st.subheader("Gewichtungen (optional)")
-    weights = {}
+    weights: Dict[str, float] = {}
     for mk in all_modules:
-        weights[mk] = st.number_input(f"Gewicht {mk}", min_value=0.0, max_value=3.0, step=0.1, value=float(weights_default.get(mk, 1.0)))
+        weights[mk] = st.number_input(
+            f"Gewicht {mk}",
+            min_value=0.0, max_value=3.0, step=0.1,
+            value=float(weights_default.get(mk, 1.0))
+        )
 
     st.divider()
     st.subheader("Profil speichern/aktualisieren")
     if st.button("Profil speichern"):
-        key = new_name.strip() if selected_profile == "— Neu —" and new_name.strip() else selected_profile
+        key = new_name.strip() if (selected_profile == "— Neu —" and new_name.strip()) else selected_profile
         st.session_state["profiles"][key] = {"focus": focus or focus_default, "weights": weights}
         st.success(f"Profil gespeichert: {key}")
 
@@ -283,9 +354,9 @@ with col3:
     grade = st.text_input("Klasse/Jahrgang", value="")
 topic = st.text_input("Thema/Sequenz", value="")
 
-selected_modules = focus or list(BLI_DATA.keys())  # wenn kein Fokus gesetzt, alles
+selected_modules = focus or list(BLI_DATA.keys())  # wenn kein Fokus gesetzt, dann alle
 
-# Formularzustand initialisieren
+# Formularzustand initialisieren (bei Fokus-Wechsel neu erstellen)
 if "form" not in st.session_state or st.session_state.get("form_modules") != selected_modules:
     st.session_state["form"] = init_form(selected_modules)
     st.session_state["form_modules"] = selected_modules
@@ -306,18 +377,19 @@ st.subheader("Bewertung je Kriterium (0–4)")
 for mk in selected_modules:
     box = st.expander(f"{mk} – {BLI_DATA[mk]['title']}", expanded=False)
     with box:
-        # Kopfzeile
         st.markdown("**Skala:** 0= nicht beobachtbar, 1= Ansatzweise, 2= Grundlegend, 3= Gut, 4= Sehr stark")
         for ck, ctext in BLI_DATA[mk]["criteria"].items():
             ccol = st.container()
             with ccol:
                 c1, c2 = st.columns([1, 3])
                 with c1:
-                    rating = st.slider(f"{mk}.{ck}:", 0, 4, value=form.modules[mk].criteria[ck].rating, key=f"rating_{mk}_{ck}")
+                    rating_key = f"rating_{mk}_{ck}"
+                    rating = st.slider(f"{mk}.{ck}:", 0, 4, value=form.modules[mk].criteria[ck].rating, key=rating_key)
                 with c2:
                     # Auto-Kommentar vorschlagen
                     default_comment = AUTO_COMMENTS.get(rating, "")
-                    comment = st.text_area(f"Kommentar – {ctext}", value=form.modules[mk].criteria[ck].comment or default_comment, key=f"comment_{mk}_{ck}")
+                    comment_key = f"comment_{mk}_{ck}"
+                    comment = st.text_area(f"Kommentar – {ctext}", value=form.modules[mk].criteria[ck].comment or default_comment, key=comment_key)
                 # Speichern
                 form.modules[mk].criteria[ck].rating = rating
                 form.modules[mk].criteria[ck].comment = comment
@@ -330,7 +402,6 @@ form.strengths = strengths
 form.next_steps = next_steps
 
 # Live-Scores
-per_module, overall = None, None
 if form.modules:
     per_module, overall = compute_scores(form)
     cols = st.columns(len(selected_modules) + 1)
@@ -342,14 +413,18 @@ if form.modules:
 
 # Export
 st.subheader("Exportieren")
-c1, c2 = st.columns(2)
+c1, c2, c3 = st.columns(3)
 with c1:
     docx_bytes = export_docx(form)
     fname = f"Hospitationsbogen_{form.colleague.replace(' ', '_')}_{form.date}.docx"
     st.download_button("DOCX herunterladen", data=docx_bytes, file_name=fname, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 with c2:
+    pdf_bytes = export_pdf(form)
+    pname = f"Hospitationsbogen_{form.colleague.replace(' ', '_')}_{form.date}.pdf"
+    st.download_button("PDF herunterladen", data=pdf_bytes, file_name=pname, mime="application/pdf")
+with c3:
     json_bytes = export_json(form)
     jname = f"Hospitationsbogen_{form.colleague.replace(' ', '_')}_{form.date}.json"
     st.download_button("JSON herunterladen", data=json_bytes, file_name=jname, mime="application/json")
 
-st.info("Hinweis: Inhalte, Skalen und Gewichtungen sind schul-intern anpassbar. Fügen Sie bei Bedarf Indikatoren/Belege hinzu (z. B. Checklisten, Beobachtungsnotizen).")
+st.info("Hinweis: Inhalte, Skalen und Gewichtungen sind schul-intern anpassbar. Fügen Sie bei Bedarf Indikatoren/Belege hinzu (z. B. Checklisten, Beobachtungsnotizen).")
